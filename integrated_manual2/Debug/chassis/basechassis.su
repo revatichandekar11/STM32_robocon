@@ -1,0 +1,6 @@
+../chassis/basechassis.c:11:6:forward	8	static
+../chassis/basechassis.c:20:6:backward	8	static
+../chassis/basechassis.c:29:6:rightchassis	8	static
+../chassis/basechassis.c:39:6:leftchassis	8	static
+../chassis/basechassis.c:49:6:clockwise	8	static
+../chassis/basechassis.c:59:6:anticlockwise	8	static
