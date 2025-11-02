@@ -29,12 +29,13 @@
 #include <math.h>
 #include "pca9685.h"
 #include "bno055_stm32.h"
+#include "arm_math.h" 
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
-// PID Structure
+// PID Structure with DSP filtering
 typedef struct {
     float kp;           // Proportional gain
     float ki;           // Integral gain
@@ -43,6 +44,19 @@ typedef struct {
     float integral;     // Integral term
     float max_output;   // Maximum output limit
     float min_output;   // Minimum output limit
+    
+    // DSP Filter components
+    arm_biquad_casd_df1_inst_f32 lpf_error;      // Low-pass filter for error
+    arm_biquad_casd_df1_inst_f32 lpf_derivative; // Low-pass filter for derivative
+    float lpf_error_state[4];                     // Filter state for error (2 stages)
+    float lpf_derivative_state[4];                // Filter state for derivative
+    float lpf_error_coeffs[5];                    // Biquad coefficients for error filter
+    float lpf_derivative_coeffs[5];               // Biquad coefficients for derivative filter
+    
+    // Additional filtering variables
+    float filtered_error;
+    float filtered_derivative;
+    float prev_measurement;  // For derivative calculation
 } PID_Controller;
 
 // Motor structure with encoder
@@ -52,6 +66,11 @@ typedef struct {
     float velocity;
     float target_velocity;
     PID_Controller pid;
+    
+    // Moving average filter for velocity smoothing
+    arm_fir_instance_f32 velocity_fir;
+    float velocity_fir_state[16];  // FIR filter state (order + blockSize - 1)
+    float velocity_fir_coeffs[8];  // FIR filter coefficients (8-tap moving average)
 } Motor;
 
 // Robot position structure
@@ -179,7 +198,29 @@ long map(long x, long in_min, long in_max, long out_min, long out_max);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-// Initialize PID controller
+// Calculate biquad low-pass filter coefficients (2nd order Butterworth)
+void Calculate_LPF_Coefficients(float *coeffs, float sample_freq, float cutoff_freq) {
+    float omega = 2.0f * M_PI * cutoff_freq / sample_freq;
+    float sn = sinf(omega);
+    float cs = cosf(omega);
+    float alpha = sn / (2.0f * 0.707f); // Q = 0.707 for Butterworth
+    
+    float b0 = (1.0f - cs) / 2.0f;
+    float b1 = 1.0f - cs;
+    float b2 = (1.0f - cs) / 2.0f;
+    float a0 = 1.0f + alpha;
+    float a1 = -2.0f * cs;
+    float a2 = 1.0f - alpha;
+    
+    // Normalize coefficients
+    coeffs[0] = b0 / a0;
+    coeffs[1] = b1 / a0;
+    coeffs[2] = b2 / a0;
+    coeffs[3] = a1 / a0;
+    coeffs[4] = a2 / a0;
+}
+
+// Initialize PID controller with DSP filters
 void PID_Init(PID_Controller *pid, float kp, float ki, float kd, float max_out, float min_out) {
     pid->kp = kp;
     pid->ki = ki;
@@ -188,53 +229,167 @@ void PID_Init(PID_Controller *pid, float kp, float ki, float kd, float max_out, 
     pid->integral = 0.0f;
     pid->max_output = max_out;
     pid->min_output = min_out;
+    pid->filtered_error = 0.0f;
+    pid->filtered_derivative = 0.0f;
+    pid->prev_measurement = 0.0f;
+    
+    // Initialize filter states to zero
+    memset(pid->lpf_error_state, 0, sizeof(pid->lpf_error_state));
+    memset(pid->lpf_derivative_state, 0, sizeof(pid->lpf_derivative_state));
+    
+    // Calculate low-pass filter coefficients
+    // Error filter: 10Hz cutoff at 50Hz sample rate
+    Calculate_LPF_Coefficients(pid->lpf_error_coeffs, 50.0f, 10.0f);
+    
+    // Derivative filter: 5Hz cutoff at 50Hz sample rate (more aggressive filtering)
+    Calculate_LPF_Coefficients(pid->lpf_derivative_coeffs, 50.0f, 5.0f);
+    
+    // Initialize biquad cascade filters (1 stage each)
+    arm_biquad_cascade_df1_init_f32(&pid->lpf_error, 1, 
+                                    pid->lpf_error_coeffs, 
+                                    pid->lpf_error_state);
+    
+    arm_biquad_cascade_df1_init_f32(&pid->lpf_derivative, 1, 
+                                    pid->lpf_derivative_coeffs, 
+                                    pid->lpf_derivative_state);
 }
 
-// Calculate PID output
+// Calculate PID output with DSP filtering
 float PID_Calculate(PID_Controller *pid, float setpoint, float measured_value, float dt) {
     float error = setpoint - measured_value;
-
-    // Proportional term
-    float proportional = pid->kp * error;
-
-    // Integral term
-    pid->integral += error * dt;
+    
+    // Apply low-pass filter to error signal
+    arm_biquad_cascade_df1_f32(&pid->lpf_error, &error, &pid->filtered_error, 1);
+    
+    // Proportional term (using filtered error)
+    float proportional = pid->kp * pid->filtered_error;
+    
+    // Integral term (using filtered error)
+    pid->integral += pid->filtered_error * dt;
+    
+    // Anti-windup: Clamp integral
+    float integral_limit = 50.0f;
+    if (pid->integral > integral_limit) pid->integral = integral_limit;
+    if (pid->integral < -integral_limit) pid->integral = -integral_limit;
+    
     float integral = pid->ki * pid->integral;
-
-    // Derivative term
-    float derivative = pid->kd * (error - pid->prev_error) / dt;
-
+    
+    // Derivative term (derivative on measurement to avoid derivative kick)
+    float raw_derivative = -(measured_value - pid->prev_measurement) / dt;
+    
+    // Apply low-pass filter to derivative
+    arm_biquad_cascade_df1_f32(&pid->lpf_derivative, &raw_derivative, 
+                               &pid->filtered_derivative, 1);
+    
+    float derivative = pid->kd * pid->filtered_derivative;
+    
     // Calculate output
     float output = proportional + integral + derivative;
-
+    
     // Clamp output
     if (output > pid->max_output) output = pid->max_output;
     if (output < pid->min_output) output = pid->min_output;
-
-    // Anti-windup for integral term
+    
+    // Advanced anti-windup: back-calculate integral if saturated
     if (output == pid->max_output || output == pid->min_output) {
-        pid->integral -= error * dt;
+        pid->integral -= pid->filtered_error * dt;
     }
-
-    pid->prev_error = error;
+    
+    // Update previous values
+    pid->prev_error = pid->filtered_error;
+    pid->prev_measurement = measured_value;
+    
     return output;
 }
 
-// Initialize motor with PID
+// Initialize motor with PID and velocity filter
 void Motor_Init(Motor *motor, float kp, float ki, float kd) {
     motor->encoder_count = 0;
     motor->prev_encoder_count = 0;
     motor->velocity = 0.0f;
     motor->target_velocity = 0.0f;
-    PID_Init(&motor->pid, kp, ki, kd, 100.0f, -100.0f); // PWM duty cycle limits
+    
+    // Initialize PID with DSP filters
+    PID_Init(&motor->pid, kp, ki, kd, 100.0f, -100.0f);
+    
+    // Initialize FIR filter state
+    memset(motor->velocity_fir_state, 0, sizeof(motor->velocity_fir_state));
+    
+    // 8-tap moving average filter coefficients (simple averaging)
+    for (int i = 0; i < 8; i++) {
+        motor->velocity_fir_coeffs[i] = 1.0f / 8.0f;
+    }
+    
+    // Initialize FIR filter instance
+    arm_fir_init_f32(&motor->velocity_fir, 8, 
+                     motor->velocity_fir_coeffs, 
+                     motor->velocity_fir_state, 1);
 }
 
-// Update motor velocity from encoder
+// Update motor velocity from encoder with FIR filtering
 void Update_Motor_Velocity(Motor *motor, float dt) {
     int32_t delta_count = motor->encoder_count - motor->prev_encoder_count;
-    motor->velocity = (float)delta_count / (ENCODER_PPR * dt) * 2.0f * M_PI * WHEEL_RADIUS;
+    
+    // Calculate raw velocity
+    float raw_velocity = (float)delta_count / (ENCODER_PPR * dt) * 2.0f * M_PI * WHEEL_RADIUS;
+    
+    // Apply FIR moving average filter to velocity
+    arm_fir_f32(&motor->velocity_fir, &raw_velocity, &motor->velocity, 1);
+    
     motor->prev_encoder_count = motor->encoder_count;
 }
+
+// Additional utility: Apply median filter for spike rejection (optional)
+float Median_Filter_3(float a, float b, float c) {
+    // Simple 3-sample median filter using ARM DSP sort
+    float samples[3] = {a, b, c};
+    
+    // Simple sorting for 3 samples
+    if (samples[0] > samples[1]) {
+        float temp = samples[0];
+        samples[0] = samples[1];
+        samples[1] = temp;
+    }
+    if (samples[1] > samples[2]) {
+        float temp = samples[1];
+        samples[1] = samples[2];
+        samples[2] = temp;
+    }
+    if (samples[0] > samples[1]) {
+        float temp = samples[0];
+        samples[0] = samples[1];
+        samples[1] = temp;
+    }
+    
+    return samples[1]; // Return median
+}
+
+// Enhanced velocity calculation with outlier rejection
+void Update_Motor_Velocity_Advanced(Motor *motor, float dt) {
+    static float velocity_history[4][3] = {0}; // History for each motor
+    static int motor_idx = 0; // Track which motor (0-3)
+    
+    int32_t delta_count = motor->encoder_count - motor->prev_encoder_count;
+    
+    // Calculate raw velocity
+    float raw_velocity = (float)delta_count / (ENCODER_PPR * dt) * 2.0f * M_PI * WHEEL_RADIUS;
+    
+    // Store in history and apply median filter
+    velocity_history[motor_idx][0] = velocity_history[motor_idx][1];
+    velocity_history[motor_idx][1] = velocity_history[motor_idx][2];
+    velocity_history[motor_idx][2] = raw_velocity;
+    
+    float median_filtered = Median_Filter_3(velocity_history[motor_idx][0],
+                                           velocity_history[motor_idx][1],
+                                           velocity_history[motor_idx][2]);
+    
+    // Apply FIR moving average filter after median filter
+    arm_fir_f32(&motor->velocity_fir, &median_filtered, &motor->velocity, 1);
+    
+    motor->prev_encoder_count = motor->encoder_count;
+    motor_idx = (motor_idx + 1) % 4; // Cycle through motors
+}
+
 
 // Read all encoders
 void Read_Encoders(void) {
